@@ -1,7 +1,7 @@
 const express = require("express");
 const cheerio = require("cheerio");
-const got = require("got").default;
-const { CookieJar } = require("tough-cookie");
+const https = require("https");
+const http = require("http");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -23,39 +23,97 @@ function clean(str) {
     .trim();
 }
 
-// Cookie jar — session maintain karta hai
-const jar = new CookieJar();
+// Cookie store
+const cookieStore = {};
 
-const client = got.extend({
-  cookieJar: jar,
-  headers: {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-  },
-  followRedirect: true,
-  retry: { limit: 2 },
-  timeout: { request: 15000 },
-});
+function saveCookies(domain, setCookieHeader) {
+  if (!setCookieHeader) return;
+  const cookies = Array.isArray(setCookieHeader)
+    ? setCookieHeader
+    : [setCookieHeader];
+  if (!cookieStore[domain]) cookieStore[domain] = {};
+  cookies.forEach((c) => {
+    const [kv] = c.split(";");
+    const [k, v] = kv.split("=");
+    if (k && v) cookieStore[domain][k.trim()] = v.trim();
+  });
+}
 
-async function getHtml(url, referer = null) {
-  const headers = {};
-  if (referer) {
-    headers["Referer"] = referer;
-    headers["Sec-Fetch-Site"] = "cross-site";
-  } else {
-    headers["Sec-Fetch-Site"] = "none";
-  }
-  const res = await client.get(url, { headers });
-  return res.body;
+function getCookies(domain) {
+  if (!cookieStore[domain]) return "";
+  return Object.entries(cookieStore[domain])
+    .map(([k, v]) => `${k}=${v}`)
+    .join("; ");
+}
+
+function getHtml(url, referer = null) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const domain = parsed.hostname;
+    const cookies = getCookies(domain);
+
+    const headers = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Accept-Encoding": "identity",
+      "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      "Sec-Ch-Ua-Mobile": "?0",
+      "Sec-Ch-Ua-Platform": '"Windows"',
+      "Sec-Fetch-Dest": "document",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": referer ? "cross-site" : "none",
+      "Sec-Fetch-User": "?1",
+      "Upgrade-Insecure-Requests": "1",
+      "Connection": "keep-alive",
+    };
+
+    if (referer) headers["Referer"] = referer;
+    if (cookies) headers["Cookie"] = cookies;
+
+    const options = {
+      hostname: parsed.hostname,
+      path: parsed.pathname + parsed.search,
+      method: "GET",
+      headers,
+      timeout: 15000,
+    };
+
+    const lib = parsed.protocol === "https:" ? https : http;
+
+    const req = lib.request(options, (res) => {
+      // Save cookies
+      saveCookies(domain, res.headers["set-cookie"]);
+
+      // Handle redirect
+      if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+        const location = res.headers["location"];
+        if (location) {
+          const redirectUrl = location.startsWith("http")
+            ? location
+            : `${parsed.protocol}//${parsed.hostname}${location}`;
+          return resolve(getHtml(redirectUrl, referer));
+        }
+      }
+
+      if (res.statusCode !== 200) {
+        return reject(new Error(`HTTP ${res.statusCode} → ${url}`));
+      }
+
+      let data = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => resolve(data));
+    });
+
+    req.on("error", reject);
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error(`Timeout → ${url}`));
+    });
+
+    req.end();
+  });
 }
 
 // ─── PARSERS ────────────────────────────────────────────────────────────
@@ -119,12 +177,7 @@ function parseLinkmake(html) {
     const label = clean($(el).find(".dll").text());
     const match = url.match(/new\d+\.filesdl\.in\/(cloud|drive)\/([A-Za-z0-9]+)/);
     if (!match) return;
-    links.push({
-      label,
-      type: match[1],
-      code: match[2],
-      filesdlUrl: url,
-    });
+    links.push({ label, type: match[1], code: match[2], filesdlUrl: url });
   });
   return links;
 }
@@ -157,7 +210,6 @@ function parseFilesdl(html) {
 // ─── SCRAPER ────────────────────────────────────────────────────────────
 async function scrapeMovie(entry) {
   try {
-    // Step 1: Detail page
     const detailHtml = await getHtml(BASE + entry.path, BASE + "/");
     const detail = parseDetail(detailHtml);
 
@@ -170,10 +222,12 @@ async function scrapeMovie(entry) {
       };
     }
 
-    await sleep(300);
+    await sleep(500);
 
-    // Step 2: Linkmake — got + cookie jar se bypass hoga
-    const linkmakeHtml = await getHtml(detail.linkmakeUrl, BASE + entry.path);
+    const linkmakeHtml = await getHtml(
+      detail.linkmakeUrl,
+      BASE + entry.path
+    );
     const qualityLinks = parseLinkmake(linkmakeHtml);
 
     if (qualityLinks.length === 0) {
@@ -185,13 +239,12 @@ async function scrapeMovie(entry) {
       };
     }
 
-    await sleep(200);
+    await sleep(300);
 
-    // Step 3: All qualities parallel
     const downloadLinks = await Promise.all(
       qualityLinks.map(async (q) => {
         try {
-          await sleep(100);
+          await sleep(150);
           const html = await getHtml(q.filesdlUrl, detail.linkmakeUrl);
           const parsed = parseFilesdl(html);
           return {

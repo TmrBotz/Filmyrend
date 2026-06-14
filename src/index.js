@@ -1,6 +1,7 @@
 const express = require("express");
-const tlsClient = require("tls-client");
 const cheerio = require("cheerio");
+const got = require("got").default;
+const { CookieJar } = require("tough-cookie");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -22,35 +23,38 @@ function clean(str) {
     .trim();
 }
 
-// TLS Client session — Chrome 120 fingerprint
-function createSession() {
-  return new tlsClient.Session({
-    clientIdentifier: "chrome_120",
-    randomTlsExtensionOrder: true,
-  });
-}
+// Cookie jar — session maintain karta hai
+const jar = new CookieJar();
 
-async function getHtml(url, referer = null) {
-  const session = createSession();
-  const headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+const client = got.extend({
+  cookieJar: jar,
+  headers: {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
     "Sec-Ch-Ua-Mobile": "?0",
     "Sec-Ch-Ua-Platform": '"Windows"',
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": referer ? "cross-site" : "none",
     "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0",
-  };
-  if (referer) headers["Referer"] = referer;
+    "Upgrade-Insecure-Requests": "1",
+  },
+  followRedirect: true,
+  retry: { limit: 2 },
+  timeout: { request: 15000 },
+});
 
-  const res = await session.get(url, { headers });
-  if (res.status !== 200) throw new Error(`HTTP ${res.status} → ${url}`);
+async function getHtml(url, referer = null) {
+  const headers = {};
+  if (referer) {
+    headers["Referer"] = referer;
+    headers["Sec-Fetch-Site"] = "cross-site";
+  } else {
+    headers["Sec-Fetch-Site"] = "none";
+  }
+  const res = await client.get(url, { headers });
   return res.body;
 }
 
@@ -115,7 +119,12 @@ function parseLinkmake(html) {
     const label = clean($(el).find(".dll").text());
     const match = url.match(/new\d+\.filesdl\.in\/(cloud|drive)\/([A-Za-z0-9]+)/);
     if (!match) return;
-    links.push({ label, type: match[1], code: match[2], filesdlUrl: url });
+    links.push({
+      label,
+      type: match[1],
+      code: match[2],
+      filesdlUrl: url,
+    });
   });
   return links;
 }
@@ -124,8 +133,11 @@ function parseFilesdl(html) {
   const $ = cheerio.load(html);
   const fileName = clean($(".title").first().text());
   const size = clean(
-    $(".info").filter((_, e) => $(e).text().startsWith("Size:"))
-      .first().text().replace("Size:", "")
+    $(".info")
+      .filter((_, e) => $(e).text().startsWith("Size:"))
+      .first()
+      .text()
+      .replace("Size:", "")
   );
   const links = [];
   $("a[class^='button']").each((_, el) => {
@@ -145,33 +157,49 @@ function parseFilesdl(html) {
 // ─── SCRAPER ────────────────────────────────────────────────────────────
 async function scrapeMovie(entry) {
   try {
+    // Step 1: Detail page
     const detailHtml = await getHtml(BASE + entry.path, BASE + "/");
     const detail = parseDetail(detailHtml);
 
     if (!detail.linkmakeUrl) {
-      return { title: entry.title, thumbnail: entry.thumbnail, category: entry.category, error: "linkmake URL not found" };
+      return {
+        title: entry.title,
+        thumbnail: entry.thumbnail,
+        category: entry.category,
+        error: "linkmake URL not found",
+      };
     }
 
     await sleep(300);
 
-    // Linkmake — TLS client bypass karta hai 403
+    // Step 2: Linkmake — got + cookie jar se bypass hoga
     const linkmakeHtml = await getHtml(detail.linkmakeUrl, BASE + entry.path);
     const qualityLinks = parseLinkmake(linkmakeHtml);
 
     if (qualityLinks.length === 0) {
-      return { title: detail.name || entry.title, thumbnail: detail.image || entry.thumbnail, category: entry.category, error: "no filesdl links found" };
+      return {
+        title: detail.name || entry.title,
+        thumbnail: detail.image || entry.thumbnail,
+        category: entry.category,
+        error: "no filesdl links found",
+      };
     }
 
     await sleep(200);
 
-    // All qualities parallel
+    // Step 3: All qualities parallel
     const downloadLinks = await Promise.all(
       qualityLinks.map(async (q) => {
         try {
           await sleep(100);
           const html = await getHtml(q.filesdlUrl, detail.linkmakeUrl);
           const parsed = parseFilesdl(html);
-          return { quality: q.label, fileName: parsed.fileName, size: parsed.size, servers: parsed.links };
+          return {
+            quality: q.label,
+            fileName: parsed.fileName,
+            size: parsed.size,
+            servers: parsed.links,
+          };
         } catch (e) {
           return { quality: q.label, error: e.message };
         }
@@ -203,7 +231,12 @@ async function scrapeTopMovies(limit = 5) {
   const movies = parseHome(homeHtml, limit);
   if (movies.length === 0) throw new Error("Home page parse failed");
   const posts = await Promise.all(movies.map(scrapeMovie));
-  return { success: true, scraped_at: new Date().toISOString(), count: posts.length, posts };
+  return {
+    success: true,
+    scraped_at: new Date().toISOString(),
+    count: posts.length,
+    posts,
+  };
 }
 
 // ─── CACHE ──────────────────────────────────────────────────────────────
@@ -226,6 +259,19 @@ app.get("/", async (req, res) => {
   }
 });
 
-app.get("/health", (_, res) => res.json({ status: "ok", time: new Date().toISOString() }));
+app.get("/refresh", async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 5, 10);
+    const data = await scrapeTopMovies(limit);
+    cache = { data, ts: Date.now() };
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/health", (_, res) => {
+  res.json({ status: "ok", time: new Date().toISOString() });
+});
 
 app.listen(PORT, () => console.log(`Running on port ${PORT}`));
